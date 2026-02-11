@@ -6,19 +6,18 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings
-from langchain_classic.retrievers import EnsembleRetriever
+from langchain.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 PDF_FOLDER = Path(os.getenv("LEGAL_PDF_FOLDER", "legal_docs"))
 FAISS_INDEX_PATH = "faiss_index"
 
+# 🔥 Ollama embedding model
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 
 
 class EmptyRetriever:
-    """Safe fallback retriever when no PDF documents are available."""
-
     def invoke(self, _query):
         return []
 
@@ -48,8 +47,12 @@ def load_documents():
 
     documents = [doc for sublist in results for doc in sublist]
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    return text_splitter.split_documents(documents)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150
+    )
+
+    return splitter.split_documents(documents)
 
 
 def _build_retriever(loaded_documents):
@@ -61,7 +64,7 @@ def _build_retriever(loaded_documents):
         vector_store = FAISS.load_local(
             FAISS_INDEX_PATH,
             embeddings,
-            allow_dangerous_deserialization=True,
+            allow_dangerous_deserialization=True
         )
         documents = list(vector_store.docstore._dict.values())
     else:
@@ -73,22 +76,26 @@ def _build_retriever(loaded_documents):
 
     vector_retriever = vector_store.as_retriever(search_kwargs={"k": 6})
 
-    bm25_retriever = BM25Retriever.from_documents(list(documents))
+    bm25_retriever = BM25Retriever.from_documents(documents)
     bm25_retriever.k = 6
 
-    hybrid_retriever = EnsembleRetriever(
+    hybrid = EnsembleRetriever(
         retrievers=[bm25_retriever, vector_retriever],
         weights=[0.5, 0.5],
     )
 
-    return hybrid_retriever, list(documents)
+    return hybrid, documents
 
 
 retriever, documents = _build_retriever(load_documents())
 
 
 def get_filtered_retriever(filename):
-    filtered_docs = [doc for doc in documents if doc.metadata.get("source") == filename]
+    filtered_docs = [
+        doc for doc in documents
+        if doc.metadata.get("source") == filename
+    ]
+
     if not filtered_docs:
         return EmptyRetriever()
 
@@ -98,4 +105,7 @@ def get_filtered_retriever(filename):
     bm25_ret = BM25Retriever.from_documents(filtered_docs)
     bm25_ret.k = 4
 
-    return EnsembleRetriever(retrievers=[bm25_ret, vector_ret], weights=[0.5, 0.5])
+    return EnsembleRetriever(
+        retrievers=[bm25_ret, vector_ret],
+        weights=[0.5, 0.5],
+    )
