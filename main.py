@@ -1,9 +1,9 @@
-# main.py
-
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
 from vector_store import retriever, get_filtered_retriever
 
+
+# 🔥 Local LLM
 model = OllamaLLM(model="llama3.2")
 
 template = """
@@ -19,11 +19,12 @@ Context:
 Question:
 {question}
 
-Provide a clear legal explanation.
+Provide a clear legal explanation in simple language.
 """
 
 prompt = ChatPromptTemplate.from_template(template)
 chain = prompt | model
+
 
 while True:
     print("\n-----------------------------------")
@@ -32,15 +33,12 @@ while True:
     if question.lower() == "q":
         break
 
-    # 🔥 OPTIONAL: Filter by specific PDF
-    # filename = "contract1.pdf"
-    # filtered_retriever = get_filtered_retriever(filename)
-    # docs = filtered_retriever.invoke(question)
-
-    # Default: search all documents
     docs = retriever.invoke(question)
 
-    # Combine context
+    if not docs:
+        print("⚠️ No relevant documents found.")
+        continue
+
     context = "\n\n".join([doc.page_content for doc in docs])
 
     result = chain.invoke({
@@ -51,9 +49,6 @@ while True:
     print("\n📌 Answer:\n")
     print(result)
 
-    # 🔥 Print Sources
     print("\n📚 Sources:")
     for doc in docs:
-        source = doc.metadata.get("source", "Unknown")
-        page = doc.metadata.get("page", "Unknown")
-        print(f"- Page {page} of {source}")
+        print(f"- Page {doc.metadata.get('page')} of {doc.metadata.get('source')}")
