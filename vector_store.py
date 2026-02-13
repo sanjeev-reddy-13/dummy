@@ -1,166 +1,157 @@
-import os
-from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
-from langchain_ollama import OllamaEmbeddings
+from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaEmbeddings
 
 
-# 📂 Root folder (can be set via environment variable)
-PDF_FOLDER = Path(os.getenv("LEGAL_PDF_FOLDER", "legal_docs"))
-FAISS_INDEX_PATH = "faiss_index"
+# ======================================================
+# CONFIG
+# ======================================================
+BASE_DOC_FOLDER = Path("legal_docs")
+INDEX_FOLDER = Path("faiss_indexes")
 
-# 🔥 Ollama embedding model
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 
 
-# -------------------------
-# Empty retriever (fallback)
-# -------------------------
 class EmptyRetriever:
     def invoke(self, _query):
         return []
 
 
-# -------------------------
-# Load documents (RECURSIVE)
-# -------------------------
-def load_documents():
-    if not PDF_FOLDER.exists():
-        print(f"⚠️ PDF folder not found: {PDF_FOLDER.resolve()}")
-        return []
+# ======================================================
+# LOAD DOCUMENTS
+# ======================================================
+def load_domain_documents(domain_folder):
 
-    # 🔥 Recursively find all PDFs inside subfolders
-    pdf_files = list(PDF_FOLDER.rglob("*.pdf"))
-
+    pdf_files = list(domain_folder.rglob("*.pdf"))
     if not pdf_files:
-        print(f"⚠️ No PDF files found in: {PDF_FOLDER.resolve()}")
         return []
 
-    print(f"📂 Found {len(pdf_files)} PDF files (including subfolders)")
+    print(f"\n📂 Domain: {domain_folder.name}")
+    print(f"📄 PDFs: {len(pdf_files)}")
 
-    def load_pdf(file_path):
-        loader = PyPDFLoader(str(file_path))
+    def load_pdf(file):
+        loader = PyPDFLoader(str(file))
         pages = loader.load()
 
-        for page in pages:
-            page.metadata["source"] = file_path.name
-            page.metadata["page"] = page.metadata.get("page", 0)
-            page.metadata["folder"] = file_path.parent.name
-            page.metadata["full_path"] = str(file_path)
+        for p in pages:
+            p.metadata["source"] = file.name
+            p.metadata["domain"] = domain_folder.name
+            p.metadata["page"] = p.metadata.get("page", 0)
 
         return pages
 
-    # Load PDFs in parallel
     with ThreadPoolExecutor() as executor:
         results = list(executor.map(load_pdf, pdf_files))
 
-    documents = [doc for sublist in results for doc in sublist]
+    docs = [d for sub in results for d in sub]
 
-    print(f"📄 Total pages loaded: {len(documents)}")
-
-    # Split documents into chunks
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
+        chunk_size=700,
+        chunk_overlap=120
     )
 
-    split_docs = splitter.split_documents(documents)
+    chunks = splitter.split_documents(docs)
 
-    print(f"✂️ Total chunks created: {len(split_docs)}")
+    print(f"✂️ Chunks: {len(chunks)}")
+    return chunks
 
-    return split_docs
 
+# ======================================================
+# BUILD / UPDATE INDEX (INCREMENTAL)
+# ======================================================
+def build_domain_index(domain_folder):
 
-# -------------------------
-# Build Hybrid Retriever
-# -------------------------
-def _build_retriever(loaded_documents):
-    if not loaded_documents:
-        return EmptyRetriever(), []
+    docs = load_domain_documents(domain_folder)
 
-    if os.path.exists(FAISS_INDEX_PATH):
-        print("📂 Loading existing FAISS index...")
-        vector_store = FAISS.load_local(
-            FAISS_INDEX_PATH,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-        documents = list(vector_store.docstore._dict.values())
+    if not docs:
+        return EmptyRetriever()
+
+    index_path = INDEX_FOLDER / domain_folder.name
+    index_path.mkdir(parents=True, exist_ok=True)
+
+    tracker_file = index_path / "indexed_files.json"
+
+    # --- load indexed files ---
+    if tracker_file.exists():
+        indexed_files = set(json.loads(tracker_file.read_text()))
     else:
-        print("⚡ Building FAISS index...")
-        vector_store = FAISS.from_documents(loaded_documents, embeddings)
-        vector_store.save_local(FAISS_INDEX_PATH)
-        documents = loaded_documents
-        print("✅ FAISS index built successfully!")
+        indexed_files = set()
 
-    # Vector Retriever
-    vector_retriever = vector_store.as_retriever(search_kwargs={"k": 6})
+    current_files = set(d.metadata["source"] for d in docs)
+    new_files = current_files - indexed_files
 
-    # BM25 Retriever
-    bm25_retriever = BM25Retriever.from_documents(documents)
-    bm25_retriever.k = 6
+    new_docs = [
+        d for d in docs
+        if d.metadata["source"] in new_files
+    ]
 
-    # Hybrid Retriever
+    # --- Load or Create FAISS ---
+    if (index_path / "index.faiss").exists():
+
+        print(f"📂 Loading FAISS → {domain_folder.name}")
+
+        vs = FAISS.load_local(
+            str(index_path),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+
+        if new_docs:
+            print(f"➕ Adding new docs: {len(new_docs)} chunks")
+            vs.add_documents(new_docs)
+            vs.save_local(str(index_path))
+
+    else:
+        print(f"⚡ Creating FAISS → {domain_folder.name}")
+        vs = FAISS.from_documents(docs, embeddings)
+        vs.save_local(str(index_path))
+        new_files = current_files
+
+    # --- save tracker ---
+    tracker_file.write_text(
+        json.dumps(list(indexed_files | new_files))
+    )
+
+    print(f"✅ Indexed files: {len(indexed_files | new_files)}")
+
+    # --- Hybrid Retrieval ---
+    vector_ret = vs.as_retriever(search_kwargs={"k": 40})
+
+    bm25 = BM25Retriever.from_documents(docs)
+    bm25.k = 40
+
     hybrid = EnsembleRetriever(
-        retrievers=[bm25_retriever, vector_retriever],
-        weights=[0.5, 0.5],
+        retrievers=[bm25, vector_ret],
+        weights=[0.6, 0.4]
     )
 
-    return hybrid, documents
+    return hybrid
 
 
-# 🔥 Initialize retriever at startup
-retriever, documents = _build_retriever(load_documents())
+# ======================================================
+# LOAD ALL RETRIEVERS
+# ======================================================
+def load_all_retrievers():
+
+    retrievers = {}
+
+    if not BASE_DOC_FOLDER.exists():
+        print("⚠️ legal_docs folder missing")
+        return retrievers
+
+    for folder in BASE_DOC_FOLDER.iterdir():
+        if folder.is_dir():
+            retrievers[folder.name] = build_domain_index(folder)
+
+    print("\n✅ All retrievers ready!")
+    return retrievers
 
 
-# -------------------------
-# Filter by File Name
-# -------------------------
-def get_filtered_retriever(filename):
-    filtered_docs = [
-        doc for doc in documents
-        if doc.metadata.get("source") == filename
-    ]
-
-    if not filtered_docs:
-        return EmptyRetriever()
-
-    filtered_vector = FAISS.from_documents(filtered_docs, embeddings)
-
-    vector_ret = filtered_vector.as_retriever(search_kwargs={"k": 4})
-    bm25_ret = BM25Retriever.from_documents(filtered_docs)
-    bm25_ret.k = 4
-
-    return EnsembleRetriever(
-        retrievers=[bm25_ret, vector_ret],
-        weights=[0.5, 0.5],
-    )
-
-
-# -------------------------
-# Filter by Folder Name
-# -------------------------
-def get_filtered_retriever_by_folder(folder_name):
-    filtered_docs = [
-        doc for doc in documents
-        if doc.metadata.get("folder") == folder_name
-    ]
-
-    if not filtered_docs:
-        return EmptyRetriever()
-
-    filtered_vector = FAISS.from_documents(filtered_docs, embeddings)
-
-    vector_ret = filtered_vector.as_retriever(search_kwargs={"k": 4})
-    bm25_ret = BM25Retriever.from_documents(filtered_docs)
-    bm25_ret.k = 4
-
-    return EnsembleRetriever(
-        retrievers=[bm25_ret, vector_ret],
-        weights=[0.5, 0.5],
-    )
+retrievers = load_all_retrievers()

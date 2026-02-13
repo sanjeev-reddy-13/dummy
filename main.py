@@ -1,43 +1,59 @@
+import json
+from sentence_transformers import CrossEncoder
+
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
-from vector_store import retriever
+from vector_store import retrievers
 
-# 🔥 Local LLM
+
+# ======================================================
+# MODEL
+# ======================================================
 model = OllamaLLM(model="llama3.2")
 
-# ==========================================================
-# 1️⃣ QUERY EXPANSION / UNDERSTANDING LAYER
-# ==========================================================
+AVAILABLE_DOMAINS = list(retrievers.keys())
+domains_text = "\n".join(AVAILABLE_DOMAINS)
 
-rewrite_template = """
-You are a legal query expansion system.
+# ======================================================
+# RERANKER
+# ======================================================
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-Generate 3 different search queries for the following question:
-1. A simple clearer version
-2. A formal legal terminology version
-3. A version including related legal keywords
 
-Return ONLY the 3 queries separated by newline.
-Do not add numbering.
+# ======================================================
+# AUTONOMOUS QUERY PLANNER
+# ======================================================
+planner_template = """
+You are an expert legal AI planner.
 
-User Question:
+Available domains:
+{domains}
+
+Return JSON ONLY in this format:
+
+{{
+  "domains": ["Domain Name"],
+  "queries": ["query1","query2","query3"]
+}}
+
+Question:
 {question}
 """
 
-rewrite_prompt = ChatPromptTemplate.from_template(rewrite_template)
-rewrite_chain = rewrite_prompt | model
+planner_chain = (
+    ChatPromptTemplate.from_template(planner_template)
+    | model
+)
 
 
-# ==========================================================
-# 2️⃣ ANSWER GENERATION PROMPT
-# ==========================================================
-
+# ======================================================
+# ANSWER GENERATION
+# ======================================================
 answer_template = """
 You are a professional legal assistant.
 
-Answer ONLY using the provided context.
-If the answer is not found, say:
-"I could not find this information in the provided documents."
+Answer ONLY from provided context.
+Do not hallucinate.
 
 Context:
 {context}
@@ -45,80 +61,100 @@ Context:
 Question:
 {question}
 
-Provide a clear legal explanation in simple language.
-Mention relevant sections or articles if present.
+Give clear legal explanation.
+Mention acts/sections if present.
 """
 
-answer_prompt = ChatPromptTemplate.from_template(answer_template)
-answer_chain = answer_prompt | model
+answer_chain = (
+    ChatPromptTemplate.from_template(answer_template)
+    | model
+)
 
 
-# ==========================================================
-# 3️⃣ INTERACTIVE LOOP
-# ==========================================================
-
+# ======================================================
+# MAIN LOOP
+# ======================================================
 while True:
+
     print("\n-----------------------------------")
-    question = input("Ask a legal question (q to quit): ")
+    question = input("Ask legal question (q to quit): ")
 
     if question.lower() == "q":
         break
 
-    # ------------------------------------------
-    # 🔥 Step 1: Expand the query
-    # ------------------------------------------
-    expanded = rewrite_chain.invoke({
-        "question": question
-    })
+    # ---------- Planner ----------
+    try:
+        raw_plan = planner_chain.invoke({
+            "question": question,
+            "domains": domains_text
+        })
 
-    print("\n🔎 Expanded Search Queries:\n")
-    print(expanded)
+        plan = json.loads(raw_plan)
 
-    queries = [q.strip() for q in expanded.split("\n") if q.strip()]
+    except Exception:
+        print("⚠️ Planner failed → fallback")
+        plan = {
+            "domains": AVAILABLE_DOMAINS,
+            "queries": [question]
+        }
 
-    # ------------------------------------------
-    # 🔥 Step 2: Retrieve using multiple queries
-    # ------------------------------------------
+    domains = plan.get("domains", AVAILABLE_DOMAINS)
+    queries = plan.get("queries", [question])
+
+    print("\n🧠 Domains:")
+    for d in domains:
+        print("-", d)
+
+    print("\n🔎 Queries:")
+    for q in queries:
+        print("-", q)
+
+    # ---------- Retrieval ----------
     all_docs = []
 
-    for q in queries:
-        docs = retriever.invoke(q)
-        all_docs.extend(docs)
+    for domain in domains:
+        retriever = retrievers.get(domain)
 
-    # Remove duplicate chunks
-    unique_docs = list({
-        doc.page_content: doc for doc in all_docs
-    }.values())
+        if retriever:
+            for q in queries:
+                docs = retriever.invoke(q)
+                all_docs.extend(docs)
 
-    docs = unique_docs[:6]
+    # Remove duplicates
+    unique_docs = list(
+        {d.page_content: d for d in all_docs}.values()
+    )
 
-    if not docs:
-        print("⚠️ No relevant documents found.")
+    if not unique_docs:
+        print("⚠️ No documents found")
         continue
 
-    # ------------------------------------------
-    # 🔥 Step 3: Prepare context
-    # ------------------------------------------
-    context = "\n\n".join([doc.page_content for doc in docs])
+    # ---------- RERANK ----------
+    print("\n⚡ Reranking...")
 
-    # ------------------------------------------
-    # 🔥 Step 4: Generate final answer
-    # ------------------------------------------
+    pairs = [(question, d.page_content) for d in unique_docs]
+    scores = reranker.predict(pairs)
+
+    scored = list(zip(unique_docs, scores))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    top_docs = [d for d, _ in scored[:5]]
+
+    context = "\n\n".join(d.page_content for d in top_docs)
+
+    # ---------- Answer ----------
     result = answer_chain.invoke({
         "context": context,
         "question": question
     })
 
-    print("\n📌 Answer:\n")
+    print("\n📌 FINAL ANSWER:\n")
     print(result)
 
-    # ------------------------------------------
-    # 🔥 Step 5: Show Sources
-    # ------------------------------------------
     print("\n📚 Sources:")
-    for doc in docs:
+    for d in top_docs:
         print(
-            f"- Page {doc.metadata.get('page')} | "
-            f"{doc.metadata.get('source')} | "
-            f"Folder: {doc.metadata.get('folder')}"
+            f"- Page {d.metadata.get('page')} | "
+            f"{d.metadata.get('source')} | "
+            f"{d.metadata.get('domain')}"
         )
